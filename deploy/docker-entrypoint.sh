@@ -24,7 +24,8 @@ case "${APP_ROLE:-all}" in
     node server.js & WEB=$!
     trap 'kill $WORKER $WEB 2>/dev/null' TERM INT
     # If either process dies, stop the container so the orchestrator restarts it.
-    wait -n $WORKER $WEB || true
+    # (POSIX sh has no `wait -n`, so poll.)
+    while kill -0 "$WORKER" 2>/dev/null && kill -0 "$WEB" 2>/dev/null; do sleep 1; done
     kill $WORKER $WEB 2>/dev/null || true
     exit 1
     ;;

@@ -14,7 +14,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
     <html lang="en">
       <body>
         <header className="top">
-          <Link href="/" className="brand"><Logo />Tune<span>Bridge</span></Link>
+          <Link href="/" className="brand"><Logo /><b>Tune<span>Bridge</span></b></Link>
           {user ? (
             <>
               <nav><Link href="/">Dashboard</Link><Link href="/import">Import</Link></nav>

@@ -1,0 +1,162 @@
+{
+  "_comment": "TuneBridge egg for Pterodactyl (PTDL_v2). Replace OWNER in the docker image after the first image build. Needs an external Postgres (import the official 'Postgres 17' egg from eggs.pterodactyl.io).",
+  "meta": {
+    "version": "PTDL_v2",
+    "update_url": null
+  },
+  "exported_at": "2026-11-16T21:00:00+00:00",
+  "name": "TuneBridge",
+  "author": "adm.joostc@gmail.com",
+  "description": "Self-hosted music playlist transfer, backup and sync (TuneMyMusic / Soundiiz alternative). Runs the web app and the background worker in one container.",
+  "features": null,
+  "docker_images": {
+    "TuneBridge (latest)": "ghcr.io/OWNER/tunebridge:latest"
+  },
+  "file_denylist": [],
+  "startup": "/usr/local/bin/entrypoint",
+  "config": {
+    "files": "{}",
+    "startup": "{\"done\": \"Ready in\"}",
+    "logs": "{}",
+    "stop": "^C"
+  },
+  "scripts": {
+    "installation": {
+      "script": "#!/bin/ash\necho 'TuneBridge ships fully inside its image; nothing to install.'\n",
+      "container": "alpine:3.4",
+      "entrypoint": "ash"
+    }
+  },
+  "variables": [
+    {
+      "name": "Public URL",
+      "description": "The public https URL users open (used to build OAuth redirect URIs).",
+      "env_variable": "APP_URL",
+      "default_value": "https://tunebridge.jac-sys.net",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|url|max:200",
+      "field_type": "text"
+    },
+    {
+      "name": "Database URL",
+      "description": "Postgres connection string.",
+      "env_variable": "DATABASE_URL",
+      "default_value": "postgresql://tunebridge:CHANGE_ME@127.0.0.1:5432/tunebridge",
+      "user_viewable": false,
+      "user_editable": false,
+      "rules": "required|string|max:500",
+      "field_type": "text"
+    },
+    {
+      "name": "Token encryption keys",
+      "description": "Format 1:<base64 32 bytes>. Generate with: openssl rand -base64 32",
+      "env_variable": "TOKEN_ENC_KEYS",
+      "default_value": "",
+      "user_viewable": false,
+      "user_editable": false,
+      "rules": "required|string|max:500",
+      "field_type": "text"
+    },
+    {
+      "name": "Active key version",
+      "description": "Which key version encrypts new tokens.",
+      "env_variable": "TOKEN_ENC_ACTIVE",
+      "default_value": "1",
+      "user_viewable": false,
+      "user_editable": false,
+      "rules": "required|integer|min:1",
+      "field_type": "text"
+    },
+    {
+      "name": "Google sign-in client ID",
+      "description": "OAuth client ID for Sign in with Google.",
+      "env_variable": "GOOGLE_AUTH_CLIENT_ID",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|string|max:200",
+      "field_type": "text"
+    },
+    {
+      "name": "Google sign-in client secret",
+      "description": "OAuth client secret for Sign in with Google.",
+      "env_variable": "GOOGLE_AUTH_CLIENT_SECRET",
+      "default_value": "",
+      "user_viewable": false,
+      "user_editable": false,
+      "rules": "nullable|string|max:200",
+      "field_type": "text"
+    },
+    {
+      "name": "Signup policy",
+      "description": "allowlist (only listed emails), open, or closed. First user becomes admin.",
+      "env_variable": "AUTH_SIGNUP",
+      "default_value": "allowlist",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|in:allowlist,open,closed",
+      "field_type": "text"
+    },
+    {
+      "name": "Allowed emails",
+      "description": "Comma-separated emails allowed to sign in.",
+      "env_variable": "ALLOWED_EMAILS",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|string|max:1000",
+      "field_type": "text"
+    },
+    {
+      "name": "Allowed email domains",
+      "description": "Comma-separated domains allowed to sign in.",
+      "env_variable": "ALLOWED_EMAIL_DOMAINS",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|string|max:500",
+      "field_type": "text"
+    },
+    {
+      "name": "Spotify client ID",
+      "description": "Client ID of YOUR Spotify developer app.",
+      "env_variable": "SPOTIFY_CLIENT_ID",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|string|max:100",
+      "field_type": "text"
+    },
+    {
+      "name": "Process role",
+      "description": "all = web + worker in this container.",
+      "env_variable": "APP_ROLE",
+      "default_value": "all",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|in:all,web,worker",
+      "field_type": "text"
+    },
+    {
+      "name": "Worker concurrency",
+      "description": "Parallel transfer jobs.",
+      "env_variable": "WORKER_CONCURRENCY",
+      "default_value": "2",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|integer|min:1|max:16",
+      "field_type": "text"
+    },
+    {
+      "name": "Database pool size",
+      "description": "Max Postgres connections for the app.",
+      "env_variable": "DB_POOL_MAX",
+      "default_value": "8",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|integer|min:1|max:50",
+      "field_type": "text"
+    }
+  ]
+}

@@ -1,0 +1,601 @@
+// TuneBridge — PostgreSQL schema (Prisma 6)
+//
+// Design notes
+//  * Single Postgres is the only stateful dependency (queue = pg-boss, rate limits = tables below).
+//  * `Track` is a platform-agnostic canonical record; `TrackMapping` is the shared
+//    cross-platform match cache (the main lever for staying under provider quotas).
+//  * Secrets (tokens, client secrets) are stored ONLY as AES-256-GCM envelopes (`*Enc` columns).
+//  * Scheduling: `SyncJob` = the definition, `JobRun` = one execution. A UNIQUE(syncJobId, scheduledFor)
+//    makes the scheduler idempotent (double-fire / multi-replica safe).
+//  * CHECK constraints and partial indexes Prisma cannot express live in migrations/0002_constraints.
+
+generator client {
+  provider        = "prisma-client-js"
+  engineType      = "client"
+  previewFeatures = ["postgresqlExtensions"]
+  
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [pg_trgm, citext]
+}
+
+// ───────────────────────────── Enums ─────────────────────────────
+
+enum Role {
+  ADMIN
+  USER
+}
+
+enum Provider {
+  SPOTIFY
+  APPLE_MUSIC
+  YOUTUBE_MUSIC
+  TIDAL
+  DEEZER
+  AMAZON_MUSIC
+  LASTFM
+}
+
+enum AccountStatus {
+  ACTIVE
+  NEEDS_REAUTH // refresh failed with invalid_grant / user revoked
+  DISABLED // user paused it
+}
+
+enum PlaylistKind {
+  PLAYLIST
+  LIKED_SONGS
+}
+
+enum PlaylistOrigin {
+  REMOTE // lives on a streaming service
+  IMPORTED // from CSV/TXT/pasted text
+  AI_GENERATED
+}
+
+enum LibraryItemKind {
+  ALBUM
+  ARTIST
+}
+
+enum MatchMethod {
+  ISRC
+  EXACT // normalized title+artist (+duration window)
+  FUZZY // trigram / token similarity above threshold
+  MANUAL // user picked a candidate
+  CACHE // resolved from TrackMapping without an API call
+}
+
+enum JobType {
+  TRANSFER
+  SYNC_RUN
+  BACKUP
+  IMPORT
+  AI_GENERATE
+}
+
+enum JobStatus {
+  QUEUED
+  RUNNING
+  WAITING_RATE_LIMIT // parked until a provider window reopens
+  SUCCEEDED
+  PARTIAL // finished, some tracks unmatched/failed
+  FAILED
+  CANCELLED
+}
+
+enum TriggerSource {
+  USER
+  SCHEDULER
+  API
+}
+
+enum TrackOutcome {
+  MATCHED
+  UNMATCHED
+  AMBIGUOUS // candidates found, none above auto-accept threshold
+  SKIPPED_DUPLICATE
+  SKIPPED_EXISTS // already present at destination
+  FAILED // transport / API error for this item
+}
+
+enum SyncDirection {
+  ONE_WAY // source -> destination
+  TWO_WAY // 3-way merge against SyncBaseline
+}
+
+enum SyncFrequency {
+  HOURLY
+  DAILY
+  WEEKLY
+  MONTHLY
+}
+
+enum AiStatus {
+  PENDING
+  GENERATED
+  DEPLOYED
+  FAILED
+}
+
+// ───────────────────────────── Identity ─────────────────────────────
+
+model User {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email        String   @unique @db.Citext
+  name         String?
+  passwordHash String? // argon2id; null when using OIDC only
+  image        String?
+  role         Role     @default(USER)
+  timezone     String   @default("UTC") // IANA tz, drives scheduled syncs
+  locale       String   @default("en")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  sessions          Session[]
+  identities        AuthIdentity[]
+  connectedAccounts ConnectedAccount[]
+  playlists         Playlist[]
+  libraryItems      LibraryItem[]
+  syncJobs          SyncJob[]
+  jobRuns           JobRun[]
+  shareLinks        ShareLink[]
+  aiGenerations     AiGeneration[]
+  oauthStates       OAuthState[]
+}
+
+/// Login identities ("Sign in with Google", generic OIDC). Separate from ConnectedAccount, which is
+/// for streaming services. One user can have several identities; (idp, subject) is the stable key.
+/// Never match on email alone for a *different* idp unless the email is verified.
+model AuthIdentity {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId        String   @db.Uuid
+  idp           String // "google" | "oidc"
+  subject       String // OIDC `sub` — never changes, unlike email
+  email         String?  @db.Citext
+  emailVerified Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  lastLoginAt   DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([idp, subject])
+  @@index([userId])
+}
+
+/// Pre-login OIDC handshake (state + nonce + PKCE verifier); no user exists yet.
+model LoginState {
+  state           String   @id
+  idp             String
+  nonce           String
+  codeVerifierEnc String
+  redirectAfter   String?
+  expiresAt       DateTime
+  createdAt       DateTime @default(now())
+
+  @@index([expiresAt])
+}
+
+model Session {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String   @db.Uuid
+  tokenHash String   @unique // sha256 of the cookie value, never the raw token
+  userAgent String?
+  ip        String?
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// ───────────────────── Provider credentials & tokens ─────────────────────
+
+/// Instance-level developer-app credentials (self-hosting: the operator brings their own
+/// Spotify/Google/Apple/... developer apps, so nobody shares one rate-limit pool).
+model ProviderCredential {
+  provider        Provider @id
+  clientId        String
+  clientSecretEnc String? // envelope; null for PKCE-only public clients
+  /// Provider-specific extras, secrets inside are envelopes too.
+  /// Apple: { teamId, keyId, privateKeyEnc }   Google: { projectId }
+  extra           Json     @default("{}")
+  keyVersion      Int      @default(1)
+  enabled         Boolean  @default(true)
+  updatedAt       DateTime @updatedAt
+}
+
+/// Short-lived OAuth handshake state (CSRF `state` + PKCE verifier).
+model OAuthState {
+  state            String   @id // random 32 bytes, base64url
+  userId           String   @db.Uuid
+  provider         Provider
+  codeVerifierEnc  String?
+  redirectAfter    String?
+  expiresAt        DateTime
+  createdAt        DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
+}
+
+model ConnectedAccount {
+  id                String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId            String        @db.Uuid
+  provider          Provider
+  providerUserId    String
+  displayName       String?
+  email             String?
+  storefront        String? // Apple Music storefront / country code
+  scopes            String[]
+  status            AccountStatus @default(ACTIVE)
+
+  // Encrypted envelopes: "v<keyVersion>.<iv>.<tag>.<ciphertext>" (AAD = accountId:field)
+  accessTokenEnc    String?
+  refreshTokenEnc   String? // null for Apple (Music-User-Token lives in accessTokenEnc)
+  accessExpiresAt   DateTime?
+  refreshExpiresAt  DateTime? // Apple user tokens, Google testing-mode (7d) refresh tokens
+  keyVersion        Int           @default(1)
+
+  lastRefreshAt     DateTime?
+  lastErrorCode     String?
+  lastErrorAt       DateTime?
+  /// Provider told us to back off (HTTP 429 Retry-After); workers must not call before this.
+  rateLimitedUntil  DateTime?
+
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  user              User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  playlists         Playlist[]
+  libraryItems      LibraryItem[]
+  sourceRuns        JobRun[]      @relation("RunSourceAccount")
+  destRuns          JobRun[]      @relation("RunDestAccount")
+
+  @@unique([userId, provider, providerUserId])
+  @@index([provider, status])
+  @@index([accessExpiresAt]) // proactive refresh sweeper
+}
+
+// ───────────────────────── Canonical catalog ─────────────────────────
+
+/// Platform-agnostic recording. Created on first sight and enriched as mappings arrive.
+model Track {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  isrc           String?  @db.VarChar(12)
+  title          String
+  normTitle      String // lowercased, NFKD-stripped, version tags removed
+  versionTags    String[] // ["remix","live","acoustic","remaster","instrumental",...]
+  artists        String[]
+  normArtists    String // normalized primary + featured, sorted, joined with "|"
+  albumTitle     String?
+  durationMs     Int?
+  explicit       Boolean?
+  /// sha1(normTitle|primaryArtist|versionTags|round(duration/2000)) – dedupe when ISRC is absent
+  fingerprint    String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  mappings       TrackMapping[]
+  misses         MatchMiss[]
+  playlistTracks PlaylistTrack[]
+  results        JobTrackResult[]
+  baselines      SyncBaseline[]
+
+  @@index([isrc])
+  @@index([fingerprint])
+  @@index([normTitle(ops: raw("gin_trgm_ops"))], type: Gin, map: "track_norm_title_trgm")
+  @@index([normArtists(ops: raw("gin_trgm_ops"))], type: Gin, map: "track_norm_artists_trgm")
+}
+
+/// "This canonical track == that provider's track id". Global (not per user): a match found for
+/// one user saves API calls for everyone on the instance. Contains no personal data.
+model TrackMapping {
+  id              String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  trackId         String      @db.Uuid
+  provider        Provider
+  providerTrackId String
+  uri             String? // spotify:track:…, deep link, etc.
+  available       Boolean     @default(true) // false when provider reports region-locked / removed
+  matchMethod     MatchMethod
+  confidence      Float // 0..1
+  verifiedByUser  Boolean     @default(false) // manual picks beat auto matches
+  payload         Json? // raw provider metadata subset (album id, preview url …)
+  lastCheckedAt   DateTime    @default(now())
+  createdAt       DateTime    @default(now())
+
+  track Track @relation(fields: [trackId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerTrackId])
+  @@index([trackId, provider])
+}
+
+/// Negative cache: don't burn 100 quota units re-searching a track that has no match.
+model MatchMiss {
+  trackId     String   @db.Uuid
+  provider    Provider
+  attempts    Int      @default(1)
+  lastTriedAt DateTime @default(now())
+  retryAfter  DateTime // exponential: 1d, 3d, 7d, 30d …
+
+  track Track @relation(fields: [trackId], references: [id], onDelete: Cascade)
+
+  @@id([trackId, provider])
+  @@index([retryAfter])
+}
+
+// ───────────────────────── User library ─────────────────────────
+
+model Playlist {
+  id                 String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId             String         @db.Uuid
+  connectedAccountId String?        @db.Uuid // null for IMPORTED / AI_GENERATED drafts
+  provider           Provider? // denormalised from account for fast filtering
+  providerPlaylistId String?
+  kind               PlaylistKind   @default(PLAYLIST)
+  origin             PlaylistOrigin @default(REMOTE)
+  name               String
+  description        String?
+  imageUrl           String?
+  isPublic           Boolean        @default(false)
+  isCollaborative    Boolean        @default(false)
+  ownedByUser        Boolean        @default(true) // false = followed playlist (read-only source)
+  trackCount         Int            @default(0)
+  /// Spotify snapshot_id / YouTube etag / Apple lastModifiedDate: skip the fetch if unchanged.
+  remoteVersion      String?
+  lastFetchedAt      DateTime?
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+
+  user             User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  account          ConnectedAccount? @relation(fields: [connectedAccountId], references: [id], onDelete: Cascade)
+  tracks           PlaylistTrack[]
+  syncSources      SyncJob[]         @relation("SyncSource")
+  syncDestinations SyncJob[]         @relation("SyncDestination")
+  shareLinks       ShareLink[]
+  sourceRuns       JobRun[]          @relation("RunSourcePlaylist")
+  destRuns         JobRun[]          @relation("RunDestPlaylist")
+
+  @@unique([connectedAccountId, providerPlaylistId])
+  @@index([userId, provider])
+}
+
+/// Ordered membership. Duplicates are legal in real playlists, so the PK is a surrogate and
+/// order is enforced by UNIQUE(playlistId, position).
+model PlaylistTrack {
+  id              BigInt   @id @default(autoincrement())
+  playlistId      String   @db.Uuid
+  position        Int
+  trackId         String   @db.Uuid
+  providerTrackId String? // the id on the playlist's own provider, for fast diff/removal
+  addedAt         DateTime?
+
+  playlist Playlist @relation(fields: [playlistId], references: [id], onDelete: Cascade)
+  track    Track    @relation(fields: [trackId], references: [id])
+
+  @@unique([playlistId, position])
+  @@index([playlistId, trackId])
+}
+
+/// Saved albums & followed artists (liked songs are a Playlist with kind = LIKED_SONGS).
+model LibraryItem {
+  id                 String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId             String          @db.Uuid
+  connectedAccountId String          @db.Uuid
+  kind               LibraryItemKind
+  providerItemId     String
+  name               String
+  normName           String
+  artistName         String? // albums only
+  upc                String? // albums only: cross-platform key
+  imageUrl           String?
+  fetchedAt          DateTime        @default(now())
+
+  user    User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  account ConnectedAccount @relation(fields: [connectedAccountId], references: [id], onDelete: Cascade)
+
+  @@unique([connectedAccountId, kind, providerItemId])
+  @@index([userId, kind])
+  @@index([upc])
+}
+
+// ───────────────────────── Jobs, sync & results ─────────────────────────
+
+/// Definition of a recurring sync. The scheduler tick selects `enabled AND nextRunAt <= now()`.
+model SyncJob {
+  id                  String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId              String        @db.Uuid
+  name                String
+  sourcePlaylistId    String        @db.Uuid
+  destPlaylistId      String        @db.Uuid
+  direction           SyncDirection @default(ONE_WAY)
+
+  // Schedule (interpreted in `timezone`; nextRunAt is computed with DST-aware math in app code)
+  frequency           SyncFrequency @default(DAILY)
+  hourOfDay           Int           @default(3) // 0-23
+  minuteOfHour        Int           @default(0) // 0-59
+  dayOfWeek           Int? // 0=Sun … 6=Sat, WEEKLY only
+  dayOfMonth          Int? // 1-28, or -1 = last day, MONTHLY only
+  timezone            String        @default("UTC")
+
+  // Behaviour
+  removeMissing       Boolean       @default(true) // mirror deletions (ONE_WAY) / propagate (TWO_WAY)
+  keepOrder           Boolean       @default(true)
+  matchThreshold      Float         @default(0.85) // auto-accept cutoff for FUZZY
+
+  // Scheduler state
+  enabled             Boolean       @default(true)
+  nextRunAt           DateTime?
+  lastRunAt           DateTime?
+  lastRunStatus       JobStatus?
+  consecutiveFailures Int           @default(0)
+  pausedReason        String? // auto-pause after N failures or NEEDS_REAUTH
+
+  createdAt           DateTime      @default(now())
+  updatedAt           DateTime      @updatedAt
+
+  user     User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  source   Playlist       @relation("SyncSource", fields: [sourcePlaylistId], references: [id], onDelete: Cascade)
+  dest     Playlist       @relation("SyncDestination", fields: [destPlaylistId], references: [id], onDelete: Cascade)
+  runs     JobRun[]
+  baseline SyncBaseline[]
+
+  @@unique([sourcePlaylistId, destPlaylistId])
+  @@index([enabled, nextRunAt])
+  @@index([userId])
+}
+
+/// Last successfully reconciled state — required for TWO_WAY (distinguish "added on A" from
+/// "deleted on B") and cheap ONE_WAY diffs.
+model SyncBaseline {
+  syncJobId String @db.Uuid
+  trackId   String @db.Uuid
+  copies    Int    @default(1) // duplicate count
+
+  syncJob SyncJob @relation(fields: [syncJobId], references: [id], onDelete: Cascade)
+  track   Track   @relation(fields: [trackId], references: [id], onDelete: Cascade)
+
+  @@id([syncJobId, trackId])
+}
+
+/// One execution of anything asynchronous (transfer, scheduled sync run, backup, import, AI).
+model JobRun {
+  id               String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId           String        @db.Uuid
+  type             JobType
+  status           JobStatus     @default(QUEUED)
+  trigger          TriggerSource @default(USER)
+  syncJobId        String?       @db.Uuid
+  sourceAccountId  String?       @db.Uuid
+  destAccountId    String?       @db.Uuid
+  sourcePlaylistId String?       @db.Uuid
+  destPlaylistId   String?       @db.Uuid
+  options          Json          @default("{}")
+
+  /// Scheduler idempotency: the slot this run was created for. NULL for ad-hoc runs.
+  scheduledFor     DateTime?
+  /// Client- or scheduler-supplied key; protects against double submits.
+  idempotencyKey   String?       @unique
+  queueJobId       String? // pg-boss job id for cancel / inspection
+
+  // Progress (updated in batches, drives the progress bar via SSE/polling)
+  totalItems       Int           @default(0)
+  processedItems   Int           @default(0)
+  matchedItems     Int           @default(0)
+  unmatchedItems   Int           @default(0)
+  addedItems       Int           @default(0)
+  removedItems     Int           @default(0)
+  attempts         Int           @default(0)
+  waitingUntil     DateTime? // when status = WAITING_RATE_LIMIT
+  stats            Json?
+  errorCode        String?
+  errorMessage     String?
+
+  createdAt        DateTime      @default(now())
+  startedAt        DateTime?
+  finishedAt       DateTime?
+
+  user         User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  syncJob      SyncJob?          @relation(fields: [syncJobId], references: [id], onDelete: SetNull)
+  sourceAcct   ConnectedAccount? @relation("RunSourceAccount", fields: [sourceAccountId], references: [id], onDelete: SetNull)
+  destAcct     ConnectedAccount? @relation("RunDestAccount", fields: [destAccountId], references: [id], onDelete: SetNull)
+  sourcePl     Playlist?         @relation("RunSourcePlaylist", fields: [sourcePlaylistId], references: [id], onDelete: SetNull)
+  destPl       Playlist?         @relation("RunDestPlaylist", fields: [destPlaylistId], references: [id], onDelete: SetNull)
+  results      JobTrackResult[]
+
+  @@unique([syncJobId, scheduledFor]) // one run per schedule slot, even with N scheduler replicas
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([status, waitingUntil])
+}
+
+/// Per-track outcome. This table IS the "Missing Tracks" report (filter outcome <> MATCHED).
+model JobTrackResult {
+  id                BigInt       @id @default(autoincrement())
+  jobRunId          String       @db.Uuid
+  position          Int
+  trackId           String       @db.Uuid
+  outcome           TrackOutcome
+  method            MatchMethod?
+  confidence        Float?
+  matchedProviderId String?
+  /// Top-N candidates for AMBIGUOUS rows so the UI can offer "pick the right one".
+  candidates        Json?
+  reason            String? // e.g. "no_isrc_hit", "duration_mismatch", "region_locked"
+
+  run   JobRun @relation(fields: [jobRunId], references: [id], onDelete: Cascade)
+  track Track  @relation(fields: [trackId], references: [id])
+
+  @@unique([jobRunId, position])
+  @@index([jobRunId, outcome])
+}
+
+// ───────────────────────── Sharing & AI ─────────────────────────
+
+model ShareLink {
+  id         String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  slug       String    @unique // nanoid(10): tunebridge.example.com/s/<slug>
+  ownerId    String    @db.Uuid
+  playlistId String    @db.Uuid
+  title      String? // optional override
+  isActive   Boolean   @default(true)
+  expiresAt  DateTime?
+  viewCount  Int       @default(0)
+  /// Known native URLs per provider, e.g. {"SPOTIFY":"https://open.spotify.com/playlist/…"}
+  nativeUrls Json      @default("{}")
+  createdAt  DateTime  @default(now())
+
+  owner    User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  playlist Playlist @relation(fields: [playlistId], references: [id], onDelete: Cascade)
+
+  @@index([ownerId])
+  @@index([playlistId])
+}
+
+model AiGeneration {
+  id               String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId           String   @db.Uuid
+  prompt           String
+  params           Json     @default("{}") // { trackCount, explicit, decades, … }
+  model            String?
+  status           AiStatus @default(PENDING)
+  /// [{ title, artist, reason }] straight from the LLM, before matching
+  suggestions      Json?
+  resultPlaylistId String?  @db.Uuid
+  tokensIn         Int?
+  tokensOut        Int?
+  error            String?
+  createdAt        DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt(sort: Desc)])
+}
+
+// ───────────────────────── Rate limiting (no Redis) ─────────────────────────
+
+/// Token buckets, one row per limiter key, e.g. "SPOTIFY:app", "SPOTIFY:acct:<uuid>",
+/// "APPLE_MUSIC:app". Acquired with a single atomic UPDATE … RETURNING (see src/lib/rate-limit).
+model RateLimitBucket {
+  key          String   @id
+  tokens       Float
+  capacity     Float
+  refillPerSec Float
+  blockedUntil DateTime? // set from Retry-After on a 429; global pause for this key
+  updatedAt    DateTime @default(now())
+}
+
+/// Hard daily quotas (YouTube Data API units, resets 00:00 America/Los_Angeles).
+model QuotaLedger {
+  provider  Provider
+  day       DateTime @db.Date
+  unitsUsed Int      @default(0)
+  unitLimit Int
+
+  @@id([provider, day])
+}

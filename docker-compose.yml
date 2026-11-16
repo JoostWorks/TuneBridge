@@ -1,0 +1,40 @@
+# Quick start:  cp .env.example .env  (set TOKEN_ENC_KEYS, APP_URL, Google/Spotify ids)  &&  docker compose up -d
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: tunebridge
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: tunebridge
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tunebridge"]
+      interval: 5s
+      retries: 10
+
+  web:
+    image: ${TUNEBRIDGE_IMAGE:-ghcr.io/joostworks/tunebridge:latest}
+    build: .
+    restart: unless-stopped
+    depends_on: { db: { condition: service_healthy } }
+    env_file: .env
+    environment:
+      APP_ROLE: web
+      DATABASE_URL: postgresql://tunebridge:${POSTGRES_PASSWORD}@db:5432/tunebridge
+    ports: ["3000:3000"]
+
+  worker:
+    image: ${TUNEBRIDGE_IMAGE:-ghcr.io/joostworks/tunebridge:latest}
+    build: .
+    restart: unless-stopped
+    depends_on: { db: { condition: service_healthy } }
+    env_file: .env
+    environment:
+      APP_ROLE: worker
+      RUN_MIGRATIONS: "false"
+      DATABASE_URL: postgresql://tunebridge:${POSTGRES_PASSWORD}@db:5432/tunebridge
+    # scale: docker compose up -d --scale worker=3
+
+volumes:
+  pgdata:

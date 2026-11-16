@@ -14,15 +14,17 @@ built-in "Databases" feature is MariaDB only). Create a server from it, then cre
 Your connection string is `postgresql://tunebridge:<password>@<postgres-host>:<port>/tunebridge`.
 
 ## 3. Import the TuneBridge egg
-Edit `deploy/pterodactyl/egg-tunebridge.json` → replace `OWNER` in the docker image → Admin → Nests → *Websites Hosting* → **Import Egg**.
+Admin → Nests → *Websites Hosting* → **Import Egg**.
 
 ## 4. Create the server
 Admin → Servers → Create New: pick the nest/egg, give it ≥ **768 MiB** RAM, a port allocation, then fill the variables:
 `APP_URL`, `DATABASE_URL`, `TOKEN_ENC_KEYS` (`1:` + `openssl rand -base64 32`), `GOOGLE_AUTH_*`, `ALLOWED_EMAILS`, `SPOTIFY_CLIENT_ID`.
 Start it; the console shows `Ready in …` once migrations ran.
 
-## 5. Reverse proxy
-Point `https://tunebridge.jac-sys.net` at `<node-ip>:<allocated port>` (TLS at the proxy; forward `Host`/`X-Forwarded-*`).
+## 5. Cloudflare Tunnel
+Cloudflare terminates TLS, so TuneBridge listens on plain HTTP. Zero Trust → Tunnels → your tunnel → Public hostname:
+`tunebridge.jac-sys.net` → service `HTTP` `192.168.2.201:<TuneBridge port>`. Do **not** expose the Postgres port; it stays LAN-only
+(use `192.168.2.201:<postgres port>` in `DATABASE_URL`).
 
 ## 6. OAuth apps
 - **Google** (Cloud Console → Credentials → OAuth client, Web): redirect URI `https://tunebridge.jac-sys.net/api/auth/google/callback`.

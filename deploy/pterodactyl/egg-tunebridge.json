@@ -1,5 +1,5 @@
 {
-  "_comment": "TuneBridge egg for Pterodactyl (PTDL_v2). Replace OWNER in the docker image after the first image build. Needs an external Postgres (import the official 'Postgres 17' egg from eggs.pterodactyl.io).",
+  "_comment": "TuneBridge egg for Pterodactyl (PTDL_v2). Needs an external Postgres (import the official 'Postgres 17' egg from eggs.pterodactyl.io).",
   "meta": {
     "version": "PTDL_v2",
     "update_url": null
@@ -10,7 +10,7 @@
   "description": "Self-hosted music playlist transfer, backup and sync (TuneMyMusic / Soundiiz alternative). Runs the web app and the background worker in one container.",
   "features": null,
   "docker_images": {
-    "TuneBridge (latest)": "ghcr.io/OWNER/tunebridge:latest"
+    "TuneBridge (latest)": "ghcr.io/joostworks/tunebridge:latest"
   },
   "file_denylist": [],
   "startup": "/usr/local/bin/entrypoint",

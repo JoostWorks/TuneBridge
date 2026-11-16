@@ -307,6 +307,22 @@ console.log("oidc login");
   srv.close();
 }
 
+// ── built-in admin login ──────────────────────────────────────────────────
+console.log("local admin login");
+{
+  const { localAdmin, verifyLocal, throttled, recordFailure } = await import("../src/lib/auth/local");
+  assert.equal(localAdmin({ ADMIN_EMAIL: "a@b.c", ADMIN_PASSWORD: "short" } as any), null);
+  assert.equal(localAdmin({ ADMIN_EMAIL: "a@b.c" } as any), null);
+  const env = { ADMIN_EMAIL: "Me@Example.com", ADMIN_PASSWORD: "correct horse battery" } as any;
+  assert.ok(verifyLocal("me@example.com", "correct horse battery", env));
+  assert.ok(!verifyLocal("me@example.com", "wrong password here", env));
+  assert.ok(!verifyLocal("other@example.com", "correct horse battery", env));
+  ok("admin login needs both vars (12+ char password) and checks email+password");
+  for (let i = 0; i < 8; i++) recordFailure("9.9.9.9");
+  assert.ok(throttled("9.9.9.9") && !throttled("1.1.1.1"));
+  ok("repeated failures from one IP are throttled");
+}
+
 console.log(`\n${passed} checks passed`);
 await db.$disconnect(); await server.stop(); await pg.close();
 process.exit(0);

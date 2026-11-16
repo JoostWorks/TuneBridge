@@ -1,6 +1,6 @@
 import Link from "next/link";
-import { redirect } from "next/navigation";
-import { requireUser } from "@/lib/session";
+import { currentUser } from "@/lib/session";
+import { Landing } from "@/components/Landing";
 import { getDb } from "@/lib/db";
 export const dynamic = "force-dynamic";
 
@@ -8,7 +8,8 @@ const ERR: Record<string, string> = { spotify_not_configured: "Spotify isn't con
 const pill = (s: string) => (s === "SUCCEEDED" ? "ok" : s === "FAILED" ? "bad" : s === "PARTIAL" || s === "WAITING_RATE_LIMIT" ? "warn" : "");
 
 export default async function Home({ searchParams }: { searchParams: Promise<{ error?: string }> }) {
-  const user = await requireUser().catch(() => redirect("/login"));
+  const user = await currentUser().catch(() => null);
+  if (!user) return <Landing />;
   const { error } = await searchParams;
   const db = getDb();
   const [accounts, imported, runs] = await Promise.all([
@@ -20,18 +21,23 @@ export default async function Home({ searchParams }: { searchParams: Promise<{ e
     <>
       <h1>Dashboard</h1>
       <p className="sub">Connect a service, then export a playlist or transfer one.</p>
+      <div className="stats">
+        <div className="stat"><b>{accounts.length}</b><span>connected {accounts.length === 1 ? "service" : "services"}</span></div>
+        <div className="stat"><b>{imported.length}</b><span>imported playlists</span></div>
+        <div className="stat"><b>{runs.filter((r) => r.status === "SUCCEEDED").length}</b><span>recent transfers done</span></div>
+      </div>
       {error && <div className="alert">{ERR[error] ?? error}</div>}
 
       <h2>Connected services</h2>
       <div className="card">
         {accounts.map((a) => (
           <div className="row" key={a.id}>
-            <div className="grow"><strong>Spotify</strong> <span className="mute">· {a.displayName ?? a.providerUserId}</span></div>
+            <span className="avatar spotify">S</span><div className="grow"><strong>Spotify</strong> <span className="mute">· {a.displayName ?? a.providerUserId}</span></div>
             <span className={`pill ${a.status === "ACTIVE" ? "ok" : "bad"}`}>{a.status === "ACTIVE" ? "connected" : "reconnect needed"}</span>
             {a.status === "ACTIVE" ? <Link className="btn ghost" href={`/accounts/${a.id}`}>Open</Link> : <a className="btn" href="/api/connect/spotify/start">Reconnect</a>}
           </div>
         ))}
-        <div className="row"><div className="grow mute">{accounts.length ? "Add another account" : "No services connected yet"}</div><a className="btn" href="/api/connect/spotify/start">Connect Spotify</a></div>
+        <div className="row"><span className="avatar spotify">S</span><div className="grow mute">{accounts.length ? "Add another account" : "No services connected yet"}</div><a className="btn" href="/api/connect/spotify/start">Connect Spotify</a></div>
       </div>
 
       <h2>Imported playlists</h2>

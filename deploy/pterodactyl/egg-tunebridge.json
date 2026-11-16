@@ -157,6 +157,26 @@
       "user_editable": true,
       "rules": "required|integer|min:1|max:50",
       "field_type": "text"
+    },
+    {
+      "name": "Admin Email",
+      "description": "Optional built-in admin login email (lets you sign in without Google).",
+      "env_variable": "ADMIN_EMAIL",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|string|max:191",
+      "field_type": "text"
+    },
+    {
+      "name": "Admin Password",
+      "description": "Optional built-in admin login password (12+ characters).",
+      "env_variable": "ADMIN_PASSWORD",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|string|min:12|max:191",
+      "field_type": "text"
     }
   ]
 }

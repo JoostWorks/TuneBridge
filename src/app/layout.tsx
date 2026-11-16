@@ -1,9 +1,11 @@
 import "./globals.css";
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import Link from "next/link";
 import { currentUser } from "@/lib/session";
+import { Logo } from "@/components/Logo";
 
-export const metadata: Metadata = { title: "TuneBridge", description: "Move, back up and sync your music library between streaming services." };
+export const metadata: Metadata = { title: { default: "TuneBridge — move your music between services", template: "%s · TuneBridge" }, description: "Free, self-hosted playlist transfer, backup and sync between streaming services." };
+export const viewport: Viewport = { width: "device-width", initialScale: 1 };
 export const dynamic = "force-dynamic";
 
 export default async function RootLayout({ children }: { children: React.ReactNode }) {
@@ -12,16 +14,22 @@ export default async function RootLayout({ children }: { children: React.ReactNo
     <html lang="en">
       <body>
         <header className="top">
-          <Link href="/" className="brand">Tune<span>Bridge</span></Link>
-          {user && (
+          <Link href="/" className="brand"><Logo />Tune<span>Bridge</span></Link>
+          {user ? (
             <>
               <nav><Link href="/">Dashboard</Link><Link href="/import">Import</Link></nav>
               <span className="mute small">{user.email}</span>
               <form action="/api/auth/logout" method="post"><button className="ghost">Sign out</button></form>
             </>
+          ) : (
+            <>
+              <nav><a href="/#how">How it works</a><a href="/#features">Features</a><a href="/#services">Services</a></nav>
+              <Link className="btn" href="/login">Sign in</Link>
+            </>
           )}
         </header>
-        <main>{children}</main>
+        <main className={user ? undefined : "wide"}>{children}</main>
+        <footer className="site"><span>TuneBridge · free &amp; self-hosted · your data stays on your server</span><span>Not affiliated with Spotify or YouTube.</span></footer>
       </body>
     </html>
   );
